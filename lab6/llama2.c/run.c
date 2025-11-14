@@ -225,6 +225,21 @@ void softmax(float* x, int size) {
 
 void matmul_cuda(float* xout, float* x, float* w, int n, int d);
 
+inline float horizontal_sum(__m256 v) {
+    // 将256位寄存器拆分为两个128位并进行水平求和
+    __m128 vlow = _mm256_castps256_ps128(v);
+    __m128 vhigh = _mm256_extractf128_ps(v, 1);
+    vlow = _mm_add_ps(vlow, vhigh);
+    
+    // 在128位寄存器内水平求和
+    __m128 shuf = _mm_movehdup_ps(vlow);  // 复制高部分到低部分
+    __m128 sums = _mm_add_ps(vlow, shuf);
+    shuf = _mm_movehl_ps(shuf, sums);     // 移动高64位到低64位
+    sums = _mm_add_ss(sums, shuf);
+    
+    return _mm_cvtss_f32(sums);
+}
+
 void matmul(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     const int64_t gpu_threshold = 1572864;
@@ -235,63 +250,55 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     }
     // printf("Using CPU for matmul of size %d x %d\n", d, n);
     int i;
-    const int BLOCK_SIZE = 64;
-    #pragma omp parallel for private(i)
-    for (i = 0; i < d; i++) {
-        float total = 0.0f; // 标量累加器（先不用 AVX 累加整个行）
-        int64_t i_n = (int64_t)i * n;
+    #define TILE_M 16
+    #define TILE_N 128
 
-        // 分块处理 x 和 w 的第 i 行
-        for (int b = 0; b < n; b += BLOCK_SIZE) {
-            int block_end = (b + BLOCK_SIZE) < n ? (b + BLOCK_SIZE) : n;
-            int block_len = block_end - b;
+    #pragma omp parallel for
+    for (int i0 = 0; i0 < d; i0 += TILE_M) {
+        // 为 TILE_M 行准备累加器
+        __m256 acc[TILE_M];
+        float y_local[TILE_M] = {0};
 
-            // 对当前块使用 AVX 累加
-            __m256 sum_vec = _mm256_setzero_ps();
-            int j_simd_end = b + (block_len / 8) * 8;
-
-            for (int j = b; j < j_simd_end; j += 8) {
-                __m256 w_vec = _mm256_loadu_ps(&w[i_n + j]);
-                __m256 x_vec = _mm256_loadu_ps(&x[j]);
-                sum_vec = _mm256_fmadd_ps(w_vec, x_vec, sum_vec);
-            }
-            // 水平求和
-            // AVX 寄存器 sum_vec 中现在有 8 个局部的和，需要将这 8 个值加起来，得到最终的点积结果
-            // float partial_sums[8];
-            // _mm256_storeu_ps(partial_sums, sum_vec);
-            // float val = 0.0f;
-            // val = partial_sums[0] + partial_sums[1] + partial_sums[2] + partial_sums[3] +
-            //       partial_sums[4] + partial_sums[5] + partial_sums[6] + partial_sums[7];
-
-            // 将256位寄存器拆分为两个128位并进行水平求和
-            // 拆分没有性能开销
-            // sum_vec = [a0, a1, a2, a3, a4, a5, a6, a7]
-            __m128 vlow = _mm256_castps256_ps128(sum_vec);  // 提取低128位
-            __m128 vhigh = _mm256_extractf128_ps(sum_vec, 1); // 提取高128位
-            // vlow = [a0+a4, a1+a5, a2+a6, a3+a7]
-            vlow = _mm_add_ps(vlow, vhigh);
-            
-            // 在128位寄存器内水平求和
-            // vlow = [b0, b1, b2, b3]
-            // _mm_movehdup_ps([b0, b1, b2, b3]) -> shuf = [b1, b1, b3, b3]
-            __m128 shuf = _mm_movehdup_ps(vlow);  // 复制高部分到低部分
-            __m128 sums = _mm_add_ps(vlow, shuf);   // sum =[b0+b1, 2b1, b2+b3, 2b3]
-            shuf = _mm_movehl_ps(shuf, sums);     // 移动高64位到低64位 shuf = [b2+b3, 2b3, ?, ?]
-            // 相加最低位
-            sums = _mm_add_ss(sums, shuf);
-            float partial_sum = _mm_cvtss_f32(sums);
-
-            // 处理剩余的元素 
-            // for (; j < n; j++) {
-            //     partial_sum += w[i_n + j] * x[j];
-            // }
-            for (int j = j_simd_end; j < block_end; j++) {
-                partial_sum += w[i_n + j] * x[j];
-            }
-
-            total += partial_sum;
+            // 初始化累加器
+        for (int ti = 0; ti < TILE_M && (i0 + ti) < d; ti++) {
+            acc[ti] = _mm256_setzero_ps();
         }
-        xout[i] = total;
+
+        // 分块处理 n 维度
+        for (int j0 = 0; j0 < n; j0 += TILE_N) {
+            int j_end = (j0 + TILE_N) < n ? (j0 + TILE_N) : n;
+            int j_simd_end = j0 + ((j_end - j0) / 8) * 8;
+
+            // SIMD 循环：一次处理 8 个 x 元素，更新 TILE_M 行
+            for (int j = j0; j < j_simd_end; j += 8) {
+                const int prefetch_dist = 64; // in floats
+                if (j + prefetch_dist < n) {
+                    // 预取 x
+                    __builtin_prefetch(&x[j + prefetch_dist], 0, 3);
+                }
+                __m256 x_vec = _mm256_loadu_ps(&x[j]);
+
+                for (int ti = 0; ti < TILE_M && (i0 + ti) < d; ti++) {
+                    int row = i0 + ti;
+                    __m256 w_vec = _mm256_loadu_ps(&w[(int64_t)row * n + j]);
+                    acc[ti] = _mm256_fmadd_ps(w_vec, x_vec, acc[ti]);
+                }
+            }
+
+            // 处理尾部（标量）
+            for (int j = j_simd_end; j < j_end; j++) {
+                for (int ti = 0; ti < TILE_M && (i0 + ti) < d; ti++) {
+                    int row = i0 + ti;
+                    y_local[ti] += w[(int64_t)row * n + j] * x[j];
+                }
+            }
+        }
+
+        // 水平求和每个 acc[ti] 并写回 y
+        for (int ti = 0; ti < TILE_M && (i0 + ti) < d; ti++) {
+            float val = horizontal_sum(acc[ti]); 
+            xout[i0 + ti] = val + y_local[ti]; 
+        }
     }
 }
 
