@@ -235,83 +235,63 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     }
     // printf("Using CPU for matmul of size %d x %d\n", d, n);
     int i;
-    
-    // #pragma omp parallel for private(i)
+    const int BLOCK_SIZE = 64;
+    #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
-        // 初始化256位的AVX寄存器（可容纳8个float）来作为累加器，全部设为0
-        __m256 sum_vec = _mm256_setzero_ps();
-        // 用于循环展开
-        __m256 sum_vec1 = _mm256_setzero_ps();
-        __m256 sum_vec2 = _mm256_setzero_ps();
-        __m256 sum_vec3 = _mm256_setzero_ps();
-        __m256 sum_vec4 = _mm256_setzero_ps();
-        int64_t i_n = (int64_t)i * n; 
-        
-        // 每次循环处理 8 个浮点数
-        int j;
-        // int n_simd = n - (n % 8);
-        int n_simd = n & ~7; // 更高效的计算 n - (n % 8)
-        // 处理边界情况
-        for (j = 0; j <= n_simd - 32; j += 32) {
+        float total = 0.0f; // 标量累加器（先不用 AVX 累加整个行）
+        int64_t i_n = (int64_t)i * n;
 
-            // 展开4次，减少循环开销
-            for (int k = 0; k < 4; k++) {
-                int offset = j + k * 8;
-                // 加载 8 个 float 从 w 矩阵的第 i 行
-                __m256 w_vec = _mm256_loadu_ps(&w[i_n + offset]);
-                // 加载 8 个 float 从 x 向量
-                __m256 x_vec = _mm256_loadu_ps(&x[offset]);
-                if (k == 0) sum_vec1 = _mm256_fmadd_ps(w_vec, x_vec, sum_vec1);
-                else if (k == 1) sum_vec2 = _mm256_fmadd_ps(w_vec, x_vec, sum_vec2);
-                else if (k == 2) sum_vec3 = _mm256_fmadd_ps(w_vec, x_vec, sum_vec3);
-                else sum_vec4 = _mm256_fmadd_ps(w_vec, x_vec, sum_vec4);
+        // 分块处理 x 和 w 的第 i 行
+        for (int b = 0; b < n; b += BLOCK_SIZE) {
+            int block_end = (b + BLOCK_SIZE) < n ? (b + BLOCK_SIZE) : n;
+            int block_len = block_end - b;
+
+            // 对当前块使用 AVX 累加
+            __m256 sum_vec = _mm256_setzero_ps();
+            int j_simd_end = b + (block_len / 8) * 8;
+
+            for (int j = b; j < j_simd_end; j += 8) {
+                __m256 w_vec = _mm256_loadu_ps(&w[i_n + j]);
+                __m256 x_vec = _mm256_loadu_ps(&x[j]);
+                sum_vec = _mm256_fmadd_ps(w_vec, x_vec, sum_vec);
             }
-            // sum_vec = (w_vec * x_vec) + sum_vec
-            // sum_vec = _mm256_fmadd_ps(w_vec, x_vec, sum_vec);
-            sum_vec1 = _mm256_add_ps(sum_vec1, sum_vec2);
-            sum_vec3 = _mm256_add_ps(sum_vec3, sum_vec4);
-            sum_vec = _mm256_add_ps(sum_vec, _mm256_add_ps(sum_vec1, sum_vec3));
-        }
+            // 水平求和
+            // AVX 寄存器 sum_vec 中现在有 8 个局部的和，需要将这 8 个值加起来，得到最终的点积结果
+            // float partial_sums[8];
+            // _mm256_storeu_ps(partial_sums, sum_vec);
+            // float val = 0.0f;
+            // val = partial_sums[0] + partial_sums[1] + partial_sums[2] + partial_sums[3] +
+            //       partial_sums[4] + partial_sums[5] + partial_sums[6] + partial_sums[7];
 
-        // 处理剩余的SIMD块（每次8个元素）
-        for (; j < n_simd; j += 8) {
-            __m256 w_vec = _mm256_loadu_ps(&w[i_n + j]);
-            __m256 x_vec = _mm256_loadu_ps(&x[j]);
-            sum_vec = _mm256_fmadd_ps(w_vec, x_vec, sum_vec);
-        }
-        
-        // 水平求和
-        // AVX 寄存器 sum_vec 中现在有 8 个局部的和，需要将这 8 个值加起来，得到最终的点积结果
-        float partial_sums[8];
-        _mm256_storeu_ps(partial_sums, sum_vec);
-        float val = 0.0f;
-        val = partial_sums[0] + partial_sums[1] + partial_sums[2] + partial_sums[3] +
-              partial_sums[4] + partial_sums[5] + partial_sums[6] + partial_sums[7];
+            // 将256位寄存器拆分为两个128位并进行水平求和
+            // 拆分没有性能开销
+            // sum_vec = [a0, a1, a2, a3, a4, a5, a6, a7]
+            __m128 vlow = _mm256_castps256_ps128(sum_vec);  // 提取低128位
+            __m128 vhigh = _mm256_extractf128_ps(sum_vec, 1); // 提取高128位
+            // vlow = [a0+a4, a1+a5, a2+a6, a3+a7]
+            vlow = _mm_add_ps(vlow, vhigh);
+            
+            // 在128位寄存器内水平求和
+            // vlow = [b0, b1, b2, b3]
+            // _mm_movehdup_ps([b0, b1, b2, b3]) -> shuf = [b1, b1, b3, b3]
+            __m128 shuf = _mm_movehdup_ps(vlow);  // 复制高部分到低部分
+            __m128 sums = _mm_add_ps(vlow, shuf);   // sum =[b0+b1, 2b1, b2+b3, 2b3]
+            shuf = _mm_movehl_ps(shuf, sums);     // 移动高64位到低64位 shuf = [b2+b3, 2b3, ?, ?]
+            // 相加最低位
+            sums = _mm_add_ss(sums, shuf);
+            float partial_sum = _mm_cvtss_f32(sums);
 
-        // 将256位寄存器拆分为两个128位并进行水平求和
-        // 拆分没有性能开销
-        // sum_vec = [a0, a1, a2, a3, a4, a5, a6, a7]
-        __m128 vlow = _mm256_castps256_ps128(sum_vec);  // 提取低128位
-        __m128 vhigh = _mm256_extractf128_ps(sum_vec, 1); // 提取高128位
-        // vlow = [a0+a4, a1+a5, a2+a6, a3+a7]
-        vlow = _mm_add_ps(vlow, vhigh);
-        
-        // 在128位寄存器内水平求和
-        // vlow = [b0, b1, b2, b3]
-        // _mm_movehdup_ps([b0, b1, b2, b3]) -> shuf = [b1, b1, b3, b3]
-        __m128 shuf = _mm_movehdup_ps(vlow);  // 复制高部分到低部分
-        __m128 sums = _mm_add_ps(vlow, shuf);   // sum =[b0+b1, 2b1, b2+b3, 2b3]
-        shuf = _mm_movehl_ps(shuf, sums);     // 移动高64位到低64位 shuf = [b2+b3, 2b3, ?, ?]
-        // 相加最低位
-        sums = _mm_add_ss(sums, shuf);
-        float val = _mm_cvtss_f32(sums);
+            // 处理剩余的元素 
+            // for (; j < n; j++) {
+            //     partial_sum += w[i_n + j] * x[j];
+            // }
+            for (int j = j_simd_end; j < block_end; j++) {
+                partial_sum += w[i_n + j] * x[j];
+            }
 
-        // 处理剩余的元素 
-        for (; j < n; j++) {
-            val += w[i_n + j] * x[j];
+            total += partial_sum;
         }
-        
-        xout[i] = val;
+        xout[i] = total;
     }
 }
 
