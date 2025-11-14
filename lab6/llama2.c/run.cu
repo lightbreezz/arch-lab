@@ -14,9 +14,6 @@ static float* g_d_weights = NULL;     // GPU 上的 weights 基址
 static float* g_h_weights = NULL;     // Host 上的 weights 基址
 static size_t g_weights_bytes = 0;
 
-float* g_h_x_pinned = NULL;   // pinned host buffer for x
-cudaStream_t g_stream = 0;    // CUDA stream for async ops
-
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
     if (err != cudaSuccess) { \
@@ -48,29 +45,27 @@ void init_cuda_weights(float* h_weights_base, size_t bytes) {
     CUBLAS_CHECK(cublasCreate(&g_handle));
     CUDA_CHECK(cudaMalloc((void**)&g_d_weights, g_weights_bytes));
     CUDA_CHECK(cudaMemcpy(g_d_weights, g_h_weights, g_weights_bytes, cudaMemcpyHostToDevice));
-    // 创建 stream
-    if (g_stream == 0) {
-        CUDA_CHECK(cudaStreamCreate(&g_stream));
-        CUBLAS_CHECK(cublasSetStream(g_handle, g_stream));
-    }
 }
 
 void init_cuda_buffers(size_t max_n, size_t max_d) {
+    // 如果已有足够大的缓冲区，无需重新分配
     if (g_max_n >= max_n && g_max_d >= max_d) {
         return;
     }
 
-    // 释放旧资源
-    if (g_d_x) cudaFree(g_d_x);
-    if (g_d_xout) cudaFree(g_d_xout);
-    if (g_h_x_pinned) cudaFreeHost(g_h_x_pinned);
+    // 释放旧缓冲区
+    if (g_d_x) {
+        cudaFree(g_d_x);
+        g_d_x = NULL;
+    }
+    if (g_d_xout) {
+        cudaFree(g_d_xout);
+        g_d_xout = NULL;
+    }
 
-    // 分配 GPU buffer
-    CUDA_CHECK(cudaMalloc(&g_d_x, max_n * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&g_d_xout, max_d * sizeof(float)));
-
-    // 分配 pinned host memory（关键！）
-    CUDA_CHECK(cudaMallocHost(&g_h_x_pinned, max_n * sizeof(float)));
+    // 分配新缓冲区
+    CUDA_CHECK(cudaMalloc((void**)&g_d_x, max_n * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&g_d_xout, max_d * sizeof(float)));
 
     g_max_n = max_n;
     g_max_d = max_d;
@@ -122,24 +117,15 @@ void matmul_cuda(float* xout, float* x, float* w, int n, int d) {
         assert("Weights not initialized in GPU memory!" && 0);
     }
 
-    // 快速拷贝 x 到 pinned memory
-    memcpy(g_h_x_pinned, x, n * sizeof(float));
 
-    // 异步拷贝
-    CUDA_CHECK(cudaMemcpyAsync(g_d_x, g_h_x_pinned, n * sizeof(float),
-                               cudaMemcpyHostToDevice, g_stream));
+    CUDA_CHECK(cudaMemcpy(g_d_x, x, (size_t)n * sizeof(float), cudaMemcpyHostToDevice));
 
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
     CUBLAS_CHECK(cublasSgemv(g_handle, CUBLAS_OP_T, n, d, &alpha, d_w, n, g_d_x, 1, &beta, g_d_xout, 1));
 
-    // 异步拷贝结果
-    CUDA_CHECK(cudaMemcpyAsync(xout, g_d_xout, d * sizeof(float),
-                               cudaMemcpyDeviceToHost, g_stream));
-
-    // 同步等待完成
-    CUDA_CHECK(cudaStreamSynchronize(g_stream));
+    CUDA_CHECK(cudaMemcpy(xout, g_d_xout, (size_t)d * sizeof(float), cudaMemcpyDeviceToHost));
 }
 
 #ifdef __cplusplus
